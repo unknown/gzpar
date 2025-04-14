@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
-    fs::File,
-    io::{Read, Write},
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -9,24 +9,28 @@ use anyhow::{Result, ensure};
 use clap::Parser;
 use crc32fast::Hasher;
 use gzip_header::{FileSystemType, GzBuilder};
+use rayon::prelude::*;
 
 #[derive(Parser, Debug)]
 struct Cli {
     file: PathBuf,
     #[arg(short, long, default_value_t = 128 * 1024)]
-    chunk_size: usize,
+    block_size: usize,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    compress_file(&cli.file, cli.chunk_size)?;
+    compress_file(&cli.file, cli.block_size)?;
 
     Ok(())
 }
 
-fn compress_file(path: &Path, chunk_size: usize) -> Result<()> {
-    let mut file = File::open(path)?;
+fn compress_file(path: &Path, block_size: usize) -> Result<()> {
+    let bytes = fs::read(path)?;
+    let blocks = bytes.chunks(block_size).collect::<Vec<_>>();
+    let compressed_blocks = blocks.into_par_iter().map(gzip_block).collect::<Vec<_>>();
+
     let gz_extension = path
         .extension()
         .map(|e| {
@@ -37,41 +41,34 @@ fn compress_file(path: &Path, chunk_size: usize) -> Result<()> {
         .unwrap_or_else(|| OsString::from(".gz"));
     let mut output = File::create(path.with_extension(gz_extension))?;
 
-    let mut buffer = vec![0u8; chunk_size];
-    while let Ok(n) = file.read(&mut buffer) {
-        if n == 0 {
-            break;
-        }
-
-        let chunk = &buffer[..n];
-        let compressed = gzip_chunk(&chunk)?;
-        output.write_all(&compressed)?;
+    for compressed_block in compressed_blocks.into_iter().filter_map(|c| c.ok()) {
+        output.write_all(&compressed_block)?;
     }
 
     Ok(())
 }
 
-fn gzip_chunk(chunk: &[u8]) -> Result<Vec<u8>> {
+fn gzip_block(block: &[u8]) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
     let header = GzBuilder::new().os(FileSystemType::Unknown).into_header();
     output.write_all(&header)?;
 
-    let deflated = deflate_chunk(chunk)?;
+    let deflated = deflate_block(block)?;
     output.write_all(&deflated)?;
 
     let mut hasher = Hasher::new();
-    hasher.update(chunk);
+    hasher.update(block);
     let crc = hasher.finalize();
     output.write_all(&crc.to_le_bytes())?;
 
-    let total_size = chunk.len() as u32;
+    let total_size = block.len() as u32;
     output.write_all(&total_size.to_le_bytes())?;
 
     Ok(output)
 }
 
-fn deflate_chunk(chunk: &[u8]) -> Result<Vec<u8>> {
+fn deflate_block(block: &[u8]) -> Result<Vec<u8>> {
     let mut strm = libz_rs_sys::z_stream::default();
 
     let version = libz_rs_sys::zlibVersion();
@@ -96,15 +93,15 @@ fn deflate_chunk(chunk: &[u8]) -> Result<Vec<u8>> {
     };
     ensure!(err == libz_rs_sys::Z_OK, "failed to initialize stream");
 
-    strm.avail_in = chunk.len() as _;
-    strm.next_in = chunk.as_ptr();
+    strm.avail_in = block.len() as _;
+    strm.next_in = block.as_ptr();
 
-    let mut output = vec![0u8; chunk.len() * 2]; // TODO: use fine-tuned size
+    let mut output = vec![0u8; block.len() * 2]; // TODO: use fine-tuned size
     strm.avail_out = output.len() as _;
     strm.next_out = output.as_mut_ptr();
 
     let err = unsafe { libz_rs_sys::deflate(&mut strm, libz_rs_sys::Z_FINISH) };
-    ensure!(err == libz_rs_sys::Z_STREAM_END, "failed to deflate chunk");
+    ensure!(err == libz_rs_sys::Z_STREAM_END, "failed to deflate");
 
     let err = unsafe { libz_rs_sys::deflateEnd(&mut strm) };
     ensure!(err == libz_rs_sys::Z_OK, "failed to deallocate stream");
