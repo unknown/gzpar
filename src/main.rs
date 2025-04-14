@@ -10,11 +10,15 @@ use clap::Parser;
 use crc32fast::Hasher;
 use gzip_header::{FileSystemType, GzBuilder};
 use rayon::prelude::*;
+use zlib_rs::{
+    DeflateFlush, MAX_WBITS, ReturnCode,
+    deflate::{self, DeflateConfig},
+};
 
 #[derive(Parser, Debug)]
 struct Cli {
     file: PathBuf,
-    #[arg(short, long, default_value_t = 128 * 1024)]
+    #[arg(short, long, default_value_t = 128 * 1024)] // 128KB
     block_size: usize,
 }
 
@@ -29,7 +33,12 @@ fn main() -> Result<()> {
 fn compress_file(path: &Path, block_size: usize) -> Result<()> {
     let bytes = fs::read(path)?;
     let blocks = bytes.chunks(block_size).collect::<Vec<_>>();
-    let compressed_blocks = blocks.into_par_iter().map(gzip_block).collect::<Vec<_>>();
+    let num_blocks = blocks.len();
+    let compressed_blocks = blocks
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, b)| gzip_block(b, i == num_blocks - 1))
+        .collect::<Vec<_>>();
 
     let gz_extension = path
         .extension()
@@ -41,72 +50,49 @@ fn compress_file(path: &Path, block_size: usize) -> Result<()> {
         .unwrap_or_else(|| OsString::from(".gz"));
     let mut output = File::create(path.with_extension(gz_extension))?;
 
-    for compressed_block in compressed_blocks.into_iter().filter_map(|c| c.ok()) {
+    let header = GzBuilder::new().os(FileSystemType::Unknown).into_header();
+    output.write_all(&header)?;
+
+    let mut combined_hasher = Hasher::new();
+    for (compressed_block, hasher) in compressed_blocks.into_iter().filter_map(|c| c.ok()) {
         output.write_all(&compressed_block)?;
+        combined_hasher.combine(&hasher);
     }
+
+    let crc = combined_hasher.finalize();
+    output.write_all(&crc.to_le_bytes())?;
+
+    let total_size: u32 = fs::metadata(path)?.len().try_into()?;
+    output.write_all(&total_size.to_le_bytes())?;
 
     Ok(())
 }
 
-fn gzip_block(block: &[u8]) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-
-    let header = GzBuilder::new().os(FileSystemType::Unknown).into_header();
-    output.write_all(&header)?;
-
-    let deflated = deflate_block(block)?;
-    output.write_all(&deflated)?;
+fn gzip_block(block: &[u8], is_last: bool) -> Result<(Vec<u8>, Hasher)> {
+    let mut buffer = vec![0; block.len() * 2]; // TODO: fine tune this
+    let deflated = deflate_block(&mut buffer, block, is_last)?;
 
     let mut hasher = Hasher::new();
     hasher.update(block);
-    let crc = hasher.finalize();
-    output.write_all(&crc.to_le_bytes())?;
 
-    let total_size = block.len() as u32;
-    output.write_all(&total_size.to_le_bytes())?;
-
-    Ok(output)
+    Ok((deflated.to_vec(), hasher))
 }
 
-fn deflate_block(block: &[u8]) -> Result<Vec<u8>> {
-    let mut strm = libz_rs_sys::z_stream::default();
-
-    let version = libz_rs_sys::zlibVersion();
-    let stream_size = core::mem::size_of_val(&strm) as i32;
-
-    let level = libz_rs_sys::Z_DEFAULT_COMPRESSION; // the default compression level
-    let method = libz_rs_sys::Z_DEFLATED;
-    let window_bits = -15;
-    let mem_level = 8;
-    let strategy = libz_rs_sys::Z_DEFAULT_STRATEGY;
-    let err = unsafe {
-        libz_rs_sys::deflateInit2_(
-            &mut strm,
-            level,
-            method,
-            window_bits,
-            mem_level,
-            strategy,
-            version,
-            stream_size,
-        )
+fn deflate_block<'a>(output: &'a mut [u8], block: &[u8], is_last: bool) -> Result<&'a [u8]> {
+    let config = DeflateConfig {
+        // A negative `window_bits` generates raw deflate data with no zlib header or trailer.
+        window_bits: -MAX_WBITS,
+        ..Default::default()
     };
-    ensure!(err == libz_rs_sys::Z_OK, "failed to initialize stream");
 
-    strm.avail_in = block.len() as _;
-    strm.next_in = block.as_ptr();
+    let (flush, expected_err) = if is_last {
+        (DeflateFlush::Finish, ReturnCode::Ok)
+    } else {
+        (DeflateFlush::SyncFlush, ReturnCode::DataError)
+    };
 
-    let mut output = vec![0u8; block.len() * 2]; // TODO: use fine-tuned size
-    strm.avail_out = output.len() as _;
-    strm.next_out = output.as_mut_ptr();
+    let (deflated, err) = deflate::compress_slice_with_flush(output, block, config, flush);
+    ensure!(err == expected_err, "failed to deflate");
 
-    let err = unsafe { libz_rs_sys::deflate(&mut strm, libz_rs_sys::Z_FINISH) };
-    ensure!(err == libz_rs_sys::Z_STREAM_END, "failed to deflate");
-
-    let err = unsafe { libz_rs_sys::deflateEnd(&mut strm) };
-    ensure!(err == libz_rs_sys::Z_OK, "failed to deallocate stream");
-
-    let deflated = &mut output[..strm.total_out as usize];
-
-    Ok(deflated.to_vec())
+    Ok(deflated)
 }
