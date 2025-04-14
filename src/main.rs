@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
-    fs::{self, File},
-    io::Write,
+    fs::File,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -13,19 +13,20 @@ use gzip_header::{FileSystemType, GzBuilder};
 #[derive(Parser, Debug)]
 struct Cli {
     file: PathBuf,
+    #[arg(short, long, default_value_t = 128 * 1024)]
+    chunk_size: usize,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    compress_file(&cli.file)?;
+    compress_file(&cli.file, cli.chunk_size)?;
 
     Ok(())
 }
 
-fn compress_file(path: &Path) -> Result<()> {
-    let data = fs::read(path)?;
-
+fn compress_file(path: &Path, chunk_size: usize) -> Result<()> {
+    let mut file = File::open(path)?;
     let gz_extension = path
         .extension()
         .map(|e| {
@@ -36,24 +37,41 @@ fn compress_file(path: &Path) -> Result<()> {
         .unwrap_or_else(|| OsString::from(".gz"));
     let mut output = File::create(path.with_extension(gz_extension))?;
 
-    let header = GzBuilder::new().os(FileSystemType::Unknown).into_header();
-    output.write_all(&header)?;
+    let mut buffer = vec![0u8; chunk_size];
+    while let Ok(n) = file.read(&mut buffer) {
+        if n == 0 {
+            break;
+        }
 
-    let mut hasher = Hasher::new();
-    let compressed = compress_chunk(&data)?;
-    hasher.update(&data);
-    output.write_all(&compressed)?;
-
-    let crc = hasher.finalize();
-    output.write_all(&crc.to_le_bytes())?;
-
-    let total_size: u32 = data.len() as u32;
-    output.write_all(&total_size.to_le_bytes())?;
+        let chunk = &buffer[..n];
+        let compressed = gzip_chunk(&chunk)?;
+        output.write_all(&compressed)?;
+    }
 
     Ok(())
 }
 
-fn compress_chunk(chunk: &[u8]) -> Result<Vec<u8>> {
+fn gzip_chunk(chunk: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+
+    let header = GzBuilder::new().os(FileSystemType::Unknown).into_header();
+    output.write_all(&header)?;
+
+    let deflated = deflate_chunk(chunk)?;
+    output.write_all(&deflated)?;
+
+    let mut hasher = Hasher::new();
+    hasher.update(chunk);
+    let crc = hasher.finalize();
+    output.write_all(&crc.to_le_bytes())?;
+
+    let total_size = chunk.len() as u32;
+    output.write_all(&total_size.to_le_bytes())?;
+
+    Ok(output)
+}
+
+fn deflate_chunk(chunk: &[u8]) -> Result<Vec<u8>> {
     let mut strm = libz_rs_sys::z_stream::default();
 
     let version = libz_rs_sys::zlibVersion();
