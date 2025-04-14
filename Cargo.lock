@@ -222,6 +222,7 @@ dependencies = [
  "gzip-header",
  "libz-rs-sys",
  "rayon",
+ "zlib-rs",
 ]
 
 [[package]]
