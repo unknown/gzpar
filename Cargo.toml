@@ -8,6 +8,7 @@ anyhow = "1.0.97"
 clap = { version = "4.5.35", features = ["derive"] }
 crc32fast = "1.4.2"
 gzip-header = "1.0.0"
+memmap2 = "0.9.5"
 rayon = "1.10.0"
 zlib-rs = "0.5.0"
 

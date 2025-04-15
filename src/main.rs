@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    fs::{self, File},
+    fs::File,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -9,6 +9,7 @@ use anyhow::{Result, ensure};
 use clap::Parser;
 use crc32fast::Hasher;
 use gzip_header::{FileSystemType, GzBuilder};
+use memmap2::Mmap;
 use rayon::prelude::*;
 use zlib_rs::{
     DeflateFlush, MAX_WBITS, ReturnCode,
@@ -31,8 +32,9 @@ fn main() -> Result<()> {
 }
 
 fn compress_file(path: &Path, block_size: usize) -> Result<()> {
-    let bytes = fs::read(path)?;
-    let blocks = bytes.chunks(block_size).collect::<Vec<_>>();
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let blocks = mmap.chunks(block_size).collect::<Vec<_>>();
     let num_blocks = blocks.len();
     let compressed_blocks = blocks
         .into_par_iter()
@@ -62,7 +64,7 @@ fn compress_file(path: &Path, block_size: usize) -> Result<()> {
     let crc = combined_hasher.finalize();
     output.write_all(&crc.to_le_bytes())?;
 
-    let total_size: u32 = fs::metadata(path)?.len().try_into()?;
+    let total_size: u32 = file.metadata()?.len().try_into()?;
     output.write_all(&total_size.to_le_bytes())?;
 
     Ok(())
