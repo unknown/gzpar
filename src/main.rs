@@ -10,7 +10,7 @@ use clap::Parser;
 use crc32fast::Hasher;
 use gzip_header::{FileSystemType, GzBuilder};
 use memmap2::Mmap;
-use rayon::prelude::*;
+use rayon::{ThreadPoolBuilder, prelude::*};
 use zlib_rs::{
     DeflateFlush, MAX_WBITS, ReturnCode,
     deflate::{self, DeflateConfig},
@@ -21,10 +21,15 @@ struct Cli {
     file: PathBuf,
     #[arg(short, long, default_value_t = 128 * 1024)] // 128KB
     block_size: usize,
+    #[arg(short, long, default_value_t = 0)]
+    processors: usize,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    ThreadPoolBuilder::new()
+        .num_threads(cli.processors)
+        .build_global()?;
 
     compress_file(&cli.file, cli.block_size)?;
 
@@ -71,7 +76,7 @@ fn compress_file(path: &Path, block_size: usize) -> Result<()> {
 }
 
 fn gzip_block(block: &[u8], is_last: bool) -> Result<(Vec<u8>, Hasher)> {
-    let mut buffer = vec![0; block.len() * 2]; // TODO: fine tune this
+    let mut buffer = vec![0; block.len() * 11 / 10]; // TODO: fine tune this
     let deflated = deflate_block(&mut buffer, block, is_last)?;
 
     let mut hasher = Hasher::new();
