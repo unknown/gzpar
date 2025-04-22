@@ -19,7 +19,7 @@ use zlib_rs::{
 #[derive(Parser, Debug)]
 struct Cli {
     file: PathBuf,
-    #[arg(short, long, default_value_t = 128 * 1024)] // 128KB
+    #[arg(short, long, default_value_t = 128 * 1024)] // 128 KiB
     block_size: usize,
 }
 
@@ -71,7 +71,8 @@ fn compress_file(path: &Path, block_size: usize) -> Result<()> {
 }
 
 fn gzip_block(block: &[u8], is_last: bool) -> Result<(Vec<u8>, Hasher)> {
-    let mut buffer = vec![0; block.len() * 2]; // TODO: fine tune this
+    let size = deflate::compress_bound(block.len());
+    let mut buffer = vec![0; size];
     let deflated = deflate_block(&mut buffer, block, is_last)?;
 
     let mut hasher = Hasher::new();
