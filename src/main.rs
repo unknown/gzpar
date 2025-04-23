@@ -1,8 +1,10 @@
 use std::{
     ffi::OsString,
     fs::File,
-    io::Write,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
 };
 
 use anyhow::{Result, ensure};
@@ -32,16 +34,6 @@ fn main() -> Result<()> {
 }
 
 fn compress_file(path: &Path, block_size: usize) -> Result<()> {
-    let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let blocks = mmap.chunks(block_size).collect::<Vec<_>>();
-    let num_blocks = blocks.len();
-    let compressed_blocks = blocks
-        .into_par_iter()
-        .enumerate()
-        .map(|(i, b)| gzip_block(b, i == num_blocks - 1))
-        .collect::<Vec<_>>();
-
     let gz_extension = path
         .extension()
         .map(|e| {
@@ -50,22 +42,47 @@ fn compress_file(path: &Path, block_size: usize) -> Result<()> {
             e
         })
         .unwrap_or_else(|| OsString::from(".gz"));
-    let mut output = File::create(path.with_extension(gz_extension))?;
+    let output_file = File::create(path.with_extension(gz_extension))?;
+    let mut writer = BufWriter::new(output_file);
 
     let header = GzBuilder::new().os(FileSystemType::Unknown).into_header();
-    output.write_all(&header)?;
+    writer.write_all(&header)?;
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let handle = thread::spawn(move || {
+        for block in rx {
+            writer.write_all(&block).unwrap();
+        }
+    });
+
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let blocks = mmap.chunks(block_size).collect::<Vec<_>>();
+    let num_blocks = blocks.len();
+
+    let compressed_blocks = blocks
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let (block, hasher) = gzip_block(b, i == num_blocks - 1).unwrap();
+            tx.send(block).unwrap();
+            hasher
+        })
+        .collect::<Vec<_>>();
 
     let mut combined_hasher = Hasher::new();
-    for (compressed_block, hasher) in compressed_blocks.into_iter().filter_map(|c| c.ok()) {
-        output.write_all(&compressed_block)?;
+    for hasher in compressed_blocks.into_iter() {
         combined_hasher.combine(&hasher);
     }
 
     let crc = combined_hasher.finalize();
-    output.write_all(&crc.to_le_bytes())?;
+    tx.send(crc.to_le_bytes().to_vec()).unwrap();
 
     let total_size: u32 = file.metadata()?.len().try_into()?;
-    output.write_all(&total_size.to_le_bytes())?;
+    tx.send(total_size.to_le_bytes().to_vec()).unwrap();
+
+    drop(tx);
+    handle.join().unwrap();
 
     Ok(())
 }
