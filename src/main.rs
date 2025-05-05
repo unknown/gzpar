@@ -1,11 +1,14 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use crc32fast::Hasher;
 use gzip_header::{FileSystemType, GzBuilder};
@@ -41,33 +44,72 @@ fn compress_file(path: &Path, block_size: usize) -> Result<()> {
         })
         .unwrap_or_else(|| OsString::from(".gz"));
     let output_file = File::create(path.with_extension(gz_extension))?;
-    let mut writer = BufWriter::new(output_file);
+    let writer = BufWriter::new(output_file);
 
     let header = GzBuilder::new().os(FileSystemType::Unknown).into_header();
-    writer.write_all(&header)?;
 
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let blocks = mmap.chunks(block_size).collect::<Vec<_>>();
     let num_blocks = blocks.len();
+    let total_size: u32 = file.metadata()?.len().try_into()?;
 
-    let compressed_blocks = blocks
+    let (tx, rx) = mpsc::channel::<(usize, Vec<u8>, Hasher)>();
+
+    let writer_handle = thread::spawn(move || -> Result<()> {
+        let mut writer = writer;
+        let mut combined_hasher = Hasher::new();
+        let mut pending_blocks = BTreeMap::<usize, (Vec<u8>, Hasher)>::new();
+        let mut next_index_to_write = 0;
+
+        writer.write_all(&header)?;
+
+        for (index, block, hasher) in rx {
+            pending_blocks.insert(index, (block, hasher));
+
+            while let Some((block_to_write, hasher_to_combine)) =
+                pending_blocks.remove(&next_index_to_write)
+            {
+                writer
+                    .write_all(&block_to_write)
+                    .with_context(|| format!("Failed to write block {}", next_index_to_write))?;
+                combined_hasher.combine(&hasher_to_combine);
+                next_index_to_write += 1;
+            }
+        }
+
+        ensure!(
+            pending_blocks.is_empty(),
+            "Writer thread finished with pending blocks - channel closed unexpectedly."
+        );
+        ensure!(
+            next_index_to_write == num_blocks,
+            "Writer thread did not write all blocks."
+        );
+
+        let crc = combined_hasher.finalize();
+        writer.write_all(&crc.to_le_bytes())?;
+        writer.write_all(&total_size.to_le_bytes())?;
+
+        writer.flush()?;
+
+        Ok(())
+    });
+
+    let tx_compressor = tx.clone();
+    blocks
         .into_par_iter()
         .enumerate()
-        .map(|(i, b)| gzip_block(b, i == num_blocks - 1).unwrap())
-        .collect::<Vec<_>>();
+        .try_for_each(move |(i, b)| -> Result<()> {
+            let (compressed_block, hasher) = gzip_block(b, i == num_blocks - 1)?;
+            tx_compressor
+                .send((i, compressed_block, hasher))
+                .map_err(|e| anyhow::anyhow!("Failed to send block {} to writer thread: {}", i, e))
+        })?;
 
-    let mut combined_hasher = Hasher::new();
-    for (block, hasher) in compressed_blocks.into_iter() {
-        writer.write_all(&block)?;
-        combined_hasher.combine(&hasher);
-    }
+    drop(tx);
 
-    let crc = combined_hasher.finalize();
-    writer.write_all(&crc.to_le_bytes())?;
-
-    let total_size: u32 = file.metadata()?.len().try_into()?;
-    writer.write_all(&total_size.to_le_bytes())?;
+    writer_handle.join().unwrap()?;
 
     Ok(())
 }
