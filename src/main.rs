@@ -3,8 +3,6 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::mpsc,
-    thread,
 };
 
 use anyhow::{Result, ensure};
@@ -48,13 +46,6 @@ fn compress_file(path: &Path, block_size: usize) -> Result<()> {
     let header = GzBuilder::new().os(FileSystemType::Unknown).into_header();
     writer.write_all(&header)?;
 
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let handle = thread::spawn(move || {
-        for block in rx {
-            writer.write_all(&block).unwrap();
-        }
-    });
-
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let blocks = mmap.chunks(block_size).collect::<Vec<_>>();
@@ -63,26 +54,20 @@ fn compress_file(path: &Path, block_size: usize) -> Result<()> {
     let compressed_blocks = blocks
         .into_par_iter()
         .enumerate()
-        .map(|(i, b)| {
-            let (block, hasher) = gzip_block(b, i == num_blocks - 1).unwrap();
-            tx.send(block).unwrap();
-            hasher
-        })
+        .map(|(i, b)| gzip_block(b, i == num_blocks - 1).unwrap())
         .collect::<Vec<_>>();
 
     let mut combined_hasher = Hasher::new();
-    for hasher in compressed_blocks.into_iter() {
+    for (block, hasher) in compressed_blocks.into_iter() {
+        writer.write_all(&block)?;
         combined_hasher.combine(&hasher);
     }
 
     let crc = combined_hasher.finalize();
-    tx.send(crc.to_le_bytes().to_vec()).unwrap();
+    writer.write_all(&crc.to_le_bytes())?;
 
     let total_size: u32 = file.metadata()?.len().try_into()?;
-    tx.send(total_size.to_le_bytes().to_vec()).unwrap();
-
-    drop(tx);
-    handle.join().unwrap();
+    writer.write_all(&total_size.to_le_bytes())?;
 
     Ok(())
 }
